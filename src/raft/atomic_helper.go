@@ -5,6 +5,20 @@ import (
 	"time"
 )
 
+func (rf *Raft) getLastLogEntry() (uint64, uint64) {
+	rf.logLock.Lock()
+	defer rf.logLock.Unlock()
+	return rf.logs[len(rf.logs)-1].Index, rf.logs[len(rf.logs)-1].Term
+}
+func (rf *Raft) getLogEntry(index uint64) *LogEntry {
+	rf.logLock.Lock()
+	defer rf.logLock.Unlock()
+	if int(index) < len(rf.logs) {
+		return rf.logs[index]
+	}
+	return nil
+}
+
 func (rf *Raft) getCommitIndex() uint64 {
 	return atomic.LoadUint64(&rf.commitIndex)
 }
@@ -17,8 +31,8 @@ func (rf *Raft) getLastApplied() uint64 {
 	return atomic.LoadUint64(&rf.lastApplied)
 }
 
-func (rf *Raft) setLastApplied(index uint64) {
-	atomic.StoreUint64(&rf.lastApplied, index)
+func (rf *Raft) incrLastApplied(delta uint64) {
+	atomic.AddUint64(&rf.lastApplied, delta)
 }
 
 func (rf *Raft) getLeaderID() int {
@@ -43,6 +57,9 @@ func (rf *Raft) getCurrentTerm() uint64 {
 
 func (rf *Raft) setCurrentTerm(term uint64) {
 	atomic.StoreUint64(&rf.currentTerm, term)
+}
+func (rf *Raft) incrCurrentTerm(delta uint64) {
+	atomic.AddUint64(&rf.currentTerm, delta)
 }
 
 func (rf *Raft) getLastContactTime() time.Time {
