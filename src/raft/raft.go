@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"fmt"
 	//	"bytes"
 	"math/rand"
 	"sync"
@@ -29,8 +30,8 @@ import (
 )
 
 const (
-	HeartBeatInterval = time.Second / 8
-	ElectionTimeout   = 1 * time.Second
+	HeartBeatInterval = time.Second / 10
+	ElectionTimeout   = 500 * time.Millisecond
 
 	NoneVotedForID = -1
 )
@@ -77,6 +78,10 @@ type LogEntry struct {
 	Term    uint64
 	Index   uint64
 	Command interface{}
+}
+
+func (l *LogEntry) String() string {
+	return fmt.Sprintf("Term:%d Index:%d Command:%v", l.Term, l.Index, l.Command)
 }
 
 // A Go object implementing a single Raft peer.
@@ -178,8 +183,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    uint64
-	Success bool
+	Term          uint64
+	Success       bool
+	ConflictIndex uint64
+	ConflictTerm  uint64
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -191,15 +198,34 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer func() {
 		DPrintf("node:%d receive AppendEntries args:%+v reply:%v", rf.me, args, reply)
 	}()
-
+	reply.Success = false
 	if args.Term < rf.getCurrentTerm() {
-		DPrintf("node:%d receive small args.term:%d self term:%d ", rf.me, args.Term, rf.currentTerm)
-		reply.Success = false
+		DPrintf("node:%d AppendEntries receive smaller term, args:%v self term:%d ", rf.me, args.Term, rf.currentTerm)
 		reply.Term = rf.getCurrentTerm()
 		return
 	}
 
+	if args.Term > rf.getCurrentTerm() || (args.Term == rf.getCurrentTerm() && rf.getState() != Follower) {
+		DPrintf("node:%d AppendEntries receive large term:%d curTerm:%d args:%+v", rf.me, args.Term, rf.getCurrentTerm(), args)
+		rf.setState(Follower)
+		rf.setVotedFor(NoneVotedForID)
+	}
+
+	rf.setCurrentTerm(args.Term)
+	rf.setLastContact(time.Now())
+
 	lastLogIndex, lastLogTerm := rf.getLastLogEntry()
+	DPrintf("node:%d cur logs:%v args.entries:%v args:%v", rf.me, rf.logs, args.Entries, args)
+	rf.logLock.Lock()
+	if args.PrevLogIndex >= uint64(len(rf.logs)) {
+		reply.ConflictIndex = uint64(len(rf.logs))
+		rf.logLock.Unlock()
+		reply.ConflictTerm = 0
+		reply.Term = rf.getCurrentTerm()
+		DPrintf("node:%d AppendEntry prevLogIndex:%d over len(logs):%d return reply:%+v", rf.me, args.PrevLogIndex, len(rf.logs), reply)
+		return
+	}
+	rf.logLock.Unlock()
 
 	var curPrevLogTerm uint64
 	if args.PrevLogIndex == lastLogIndex {
@@ -208,19 +234,28 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		curPrevLogTerm = rf.getLogEntry(args.PrevLogIndex).Term
 	}
 
+	DPrintf("node:%d curPrevLogTerm:%d args:%v", rf.me, curPrevLogTerm, args)
 	if curPrevLogTerm != args.PrevLogTerm {
-		DPrintf("node:%d receive wrong logs. args.prevLogInd:%d args.prevLogTerm:%d curPrevTerm:%d",
-			rf.me, args.PrevLogIndex, args.PrevLogTerm, curPrevLogTerm)
-		reply.Success = false
+		DPrintf("node:%d different log PrevLogIndex:%d curPrevLogTerm:%d leaderPrevLogTerm:%d",
+			rf.me, args.PrevLogIndex, curPrevLogTerm, args.PrevLogTerm)
+		DPrintf("node:%d logs:%v appendEntries:%v", rf.me, rf.logs, args.Entries)
+		reply.ConflictTerm = curPrevLogTerm
+		rf.logLock.Lock()
+		for i := args.PrevLogIndex - 1; i >= 0; i-- {
+			if rf.logs[i].Term != reply.ConflictTerm {
+				reply.ConflictIndex = i + 1
+				break
+			}
+		}
+		rf.logLock.Unlock()
 		reply.Term = rf.getCurrentTerm()
+		DPrintf("node:%d AppendEntry prevInd:%d args.prevLogTerm:%d != curPrevLogTerm:%d, reply:%+v",
+			rf.me, args.PrevLogIndex, args.PrevLogTerm, curPrevLogTerm, reply)
 		return
 	}
 
-	rf.setCurrentTerm(args.Term)
+	reply.Term = rf.getCurrentTerm()
 	rf.setLeaderID(args.LeaderId)
-	if rf.getState() != Follower {
-		rf.setState(Follower)
-	}
 
 	if len(args.Entries) > 0 {
 		var appendEntryList []*LogEntry
@@ -232,8 +267,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 			curLogEntry := rf.getLogEntry(entry.Index)
 			if curLogEntry == nil {
-				DPrintf("node:%d get logs[%d] nil log.", rf.me, entry.Index)
-				return
+				panic(fmt.Sprintf("node:%d get logs[%d] nil log.", rf.me, entry.Index))
 			}
 
 			if curLogEntry.Term != entry.Term {
@@ -241,9 +275,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.logs = rf.logs[:entry.Index]
 				rf.logLock.Unlock()
 				appendEntryList = args.Entries[i:]
+				break
 			}
-
 		}
+
+		DPrintf("node:%d try to append entry list:%v", rf.me, appendEntryList)
 
 		rf.logLock.Lock()
 		rf.logs = append(rf.logs, appendEntryList...)
@@ -252,12 +288,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if args.LeaderCommitId > rf.getCommitIndex() {
+		rf.logLock.Lock()
 		rf.setCommitIndex(min(args.LeaderCommitId, uint64(len(rf.logs)-1)))
+		rf.logLock.Unlock()
 		rf.commitTriggerCh <- struct{}{}
 	}
 	reply.Success = true
-	reply.Term = rf.getCurrentTerm()
-	rf.setLastContact(time.Now())
 	//DPrintf("node:%d receive heartbeat success. args:%v reply:%v", rf.me, args, reply)
 	return
 }
@@ -296,13 +332,19 @@ func (rf *Raft) isLogUpToDate(prevLastLogTerm, prevLastLogIndex uint64) bool {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	defer func() {
-		DPrintf("node:%d receive vote args:%v reply:%v", rf.me, args, reply)
+		DPrintf("node:%d receive RequestVote args:%v reply:%v", rf.me, args, reply)
 	}()
 
 	if args.Term < rf.getCurrentTerm() {
 		DPrintf("node:%d receive vote small term:%d current:%d", rf.me, args.Term, rf.currentTerm)
 		reply.Term, reply.VoteGranted = rf.currentTerm, false
 		return
+	}
+	if args.Term > rf.getCurrentTerm() {
+		DPrintf("node:%d RequestVote receive large term:%d localTerm:%d change to follower", rf.me, args.Term, rf.getCurrentTerm())
+		rf.setCurrentTerm(args.Term)
+		rf.setState(Follower)
+		rf.setVotedFor(NoneVotedForID)
 	}
 
 	if args.Term == rf.getCurrentTerm() && rf.getVotedFor() != NoneVotedForID && rf.getVotedFor() != args.CandidateId {
@@ -315,7 +357,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		DPrintf("node:%d args lastTerm:%d lastIndex:%d log isn't upToDate", rf.me,
 			args.LastLogTerm, args.LastLogIndex)
 		reply.Term, reply.VoteGranted = rf.getCurrentTerm(), false
-		rf.setVotedFor(NoneVotedForID)
 		return
 	}
 
@@ -443,17 +484,18 @@ func (rf *Raft) startElection() {
 
 				if reply.Term > rf.getCurrentTerm() {
 					//become follower
-					DPrintf("node:%d term:%d reply term:%d become follower when start election", rf.me, rf.currentTerm,
-						reply.Term)
+					DPrintf("node:%d localTerm:%d peer:%d reply term:%d reply:%+v become follower when start election", rf.me, rf.currentTerm,
+						peerId, reply.Term, reply)
 					rf.setCurrentTerm(reply.Term)
 					rf.setState(Follower)
+					rf.setVotedFor(NoneVotedForID)
 					return
 				}
 				DPrintf("node:%v state:%v send vote receive resp args:%v reply:%v", rf.me, rf.state, args, reply)
 
 				if rf.getCurrentTerm() == reply.Term && reply.VoteGranted {
 					votes++
-					if votes >= (len(rf.peers)/2)+1 && rf.getState() == Candidate {
+					if votes*2 >= len(rf.peers)+1 && rf.getState() == Candidate {
 						DPrintf("node:%d term:%d votes:%d become leader", rf.me, rf.currentTerm, votes)
 						lastLogIndex, _ = rf.getLastLogEntry()
 						for i := 0; i < len(rf.peers); i++ {
@@ -475,19 +517,16 @@ func (rf *Raft) startElection() {
 }
 
 func (rf *Raft) sendReplicateToPeer(peerId int) {
-	lastLogIndex, _ := rf.getLastLogEntry()
 
 	rf.mu.Lock()
 	nextIndex := rf.nextIndex[peerId]
-	rf.mu.Unlock()
-
-	var entries []*LogEntry
 	rf.logLock.Lock()
-	for i := nextIndex; i <= lastLogIndex; i++ {
-		entries = append(entries, rf.logs[i])
-	}
+	entries := rf.logs[nextIndex:]
 	prevLog := rf.logs[nextIndex-1]
 	rf.logLock.Unlock()
+	rf.mu.Unlock()
+
+	DPrintf("node:%d leader nextIndex:%v prevLog:%v logs:%v", rf.me, rf.nextIndex, prevLog, rf.logs)
 
 	args := &AppendEntriesArgs{
 		Term:           rf.getCurrentTerm(),
@@ -507,20 +546,34 @@ func (rf *Raft) sendReplicateToPeer(peerId int) {
 			rf.setState(Follower)
 			rf.setLastContact(time.Now())
 			rf.setCurrentTerm(reply.Term)
+			rf.setVotedFor(NoneVotedForID)
 			return
 		}
 
 		if !reply.Success && rf.getState() == Leader {
 			rf.mu.Lock()
-			rf.nextIndex[peerId] = nextIndex - 1
+			if reply.ConflictTerm > 0 {
+				// 将 nextIndex 设置为第一个 ConflictTerm 出现的索引
+				rf.logLock.Lock()
+				for i := len(rf.logs) - 1; i >= 0; i-- {
+					if rf.logs[i].Term == reply.ConflictTerm {
+						rf.nextIndex[peerId] = uint64(i + 1)
+						break
+					}
+				}
+				rf.logLock.Unlock()
+			} else {
+				rf.nextIndex[peerId] = reply.ConflictIndex
+			}
 			rf.mu.Unlock()
+			DPrintf("node:%d replicate peer:%d conflict reply:%+v nextIndex:%v", rf.me, peerId, reply, rf.nextIndex)
 			return
 		}
 
 		if reply.Success && rf.getState() == Leader {
 			//todo optimise lock
 			rf.mu.Lock()
-			rf.nextIndex[peerId] = nextIndex + uint64(len(entries))
+			rf.nextIndex[peerId] += uint64(len(entries))
 			rf.matchIndex[peerId] = rf.nextIndex[peerId] - 1
 			rf.mu.Unlock()
 
@@ -594,7 +647,7 @@ func (rf *Raft) doHeartBeat() {
 			continue
 		}
 
-		go rf.sendHeartbeatToPeer(peerId)
+		go rf.sendReplicateToPeer(peerId)
 	}
 }
 

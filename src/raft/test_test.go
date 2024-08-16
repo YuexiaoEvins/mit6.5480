@@ -236,6 +236,7 @@ func TestLeaderFailure3B(t *testing.T) {
 
 	// disconnect the first leader.
 	leader1 := cfg.checkOneLeader()
+	DPrintf("%v start disconnect leader:%d", time.Now(), leader1)
 	cfg.disconnect(leader1)
 
 	// the remaining followers should elect
@@ -311,6 +312,7 @@ func TestFailNoAgree3B(t *testing.T) {
 
 	// 3 of 5 followers disconnect
 	leader := cfg.checkOneLeader()
+	DPrintf("%v start stop 3 server. leader:%d", time.Now(), leader)
 	cfg.disconnect((leader + 1) % servers)
 	cfg.disconnect((leader + 2) % servers)
 	cfg.disconnect((leader + 3) % servers)
@@ -334,10 +336,12 @@ func TestFailNoAgree3B(t *testing.T) {
 	cfg.connect((leader + 1) % servers)
 	cfg.connect((leader + 2) % servers)
 	cfg.connect((leader + 3) % servers)
+	DPrintf("%v start recover 3 server.", time.Now())
 
 	// the disconnected majority may have chosen a leader from
 	// among their own ranks, forgetting index 2.
 	leader2 := cfg.checkOneLeader()
+	DPrintf("%v new leader:%d old leader:%d.", time.Now(), leader2, leader)
 	index2, _, ok2 := cfg.rafts[leader2].Start(30)
 	if ok2 == false {
 		t.Fatalf("leader2 rejected Start()")
@@ -463,6 +467,7 @@ func TestRejoin3B(t *testing.T) {
 
 	// leader network failure
 	leader1 := cfg.checkOneLeader()
+	DPrintf("%v start disconnect leader:%d", time.Now(), leader1)
 	cfg.disconnect(leader1)
 
 	// make old leader try to agree on some entries
@@ -475,14 +480,17 @@ func TestRejoin3B(t *testing.T) {
 
 	// new leader network failure
 	leader2 := cfg.checkOneLeader()
+	DPrintf("%v start disconnect new leader:%d ole leader:%d", time.Now(), leader2, leader1)
 	cfg.disconnect(leader2)
 
 	// old leader connected again
+	DPrintf("%v start recover old leader:%d new leader:%d and put 104 command.", time.Now(), leader1, leader2)
 	cfg.connect(leader1)
 
 	cfg.one(104, 2, true)
 
 	// all together now
+	DPrintf("%v start new leader:%d old leader:%d", time.Now(), leader2, leader1)
 	cfg.connect(leader2)
 
 	cfg.one(105, servers, true)
